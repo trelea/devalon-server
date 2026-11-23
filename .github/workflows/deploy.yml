@@ -40,8 +40,8 @@ jobs:
             ADMIN_TOKEN
           vars: |
             META_GRAPH_API_VERSION
-          env:
-            TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
-            TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-            ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
-            META_GRAPH_API_VERSION: v27.0
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          META_GRAPH_API_VERSION: v27.0
