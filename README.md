@@ -27,13 +27,14 @@ The access token is never returned by the API and never exposed to the browser.
 
 ```bash
 yarn install
-cp .dev.vars.example .dev.vars   # fill in TURSO_* and ADMIN_TOKEN
-yarn migration:run               # apply schema changes to Turso
-yarn dev                         # wrangler dev
+yarn migration:run   # apply schema changes to Turso
+yarn dev             # wrangler dev
 ```
 
-Set `META_GRAPH_API_BASE_URL` to a local mock while testing to avoid sending
-real events to Meta. `wrangler.jsonc` holds non-secret vars; secrets come from
+Create a gitignored `.dev.vars` file with `TURSO_DATABASE_URL`,
+`TURSO_AUTH_TOKEN` and `ADMIN_TOKEN` before running `yarn dev`. Set
+`META_GRAPH_API_BASE_URL` to a local mock while testing to avoid sending real
+events to Meta. `wrangler.jsonc` holds non-secret vars; secrets come from
 `.dev.vars` locally and from Worker secrets in production.
 
 ## Deploy
