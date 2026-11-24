@@ -505,11 +505,9 @@ app.post("/:pixel_id/signals", async (c) => {
       request_origin,
     );
     if (!verification.ok) {
-      log("warn", "signals.rejected", {
-        reason: `jwt_${verification.reason}`,
-        pixel_id,
-      });
-      return c.json({ error: "Invalid or expired JWT" }, 403);
+      const code = `jwt_${verification.reason}`;
+      log("warn", "signals.rejected", { reason: code, pixel_id });
+      return c.json({ error: code }, 403);
     }
   }
 
