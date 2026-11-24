@@ -33,8 +33,9 @@ The signals envelope may carry `user_data` with raw `email`, `phone`,
 already hashed by the SDK's `hash_meta_user_data()` (64 hex characters) are
 passed through unchanged. `fbp`, `fbc`, `client_user_agent` and
 `client_ip_address` are sent raw, as Meta requires. The optional `opt_out` and
-`data_processing_options` fields are forwarded at event level. No PII is
-written to logs.
+`data_processing_options` fields are forwarded at event level. The `custom_data` whitelist includes Meta's standard keys plus
+`status`, `lead_event_source` and `custom_properties` (objects are serialized
+to JSON strings). No PII is written to logs.
 
 ## Local development
 

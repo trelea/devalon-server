@@ -83,6 +83,9 @@ const CUSTOM_DATA_KEYS = [
   "predicted_ltv",
   "search_string",
   "delivery_category",
+  "status",
+  "lead_event_source",
+  "custom_properties",
 ] as const;
 
 const TEST_CODE_PATTERN = /^[A-Za-z0-9_-]+$/;
@@ -155,7 +158,13 @@ export async function build_capi_event(
   const custom_data: Record<string, unknown> = {};
   for (const key of CUSTOM_DATA_KEYS) {
     const value = params[key];
-    if (value !== undefined && value !== null) custom_data[key] = value;
+    if (value === undefined || value === null) continue;
+
+    // Meta expects custom_properties as a JSON string, not a nested object.
+    custom_data[key] =
+      key === "custom_properties" && typeof value === "object"
+        ? JSON.stringify(value)
+        : value;
   }
 
   const event_source_url = payload.event_source_url || payload.referrer || "";
