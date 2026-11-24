@@ -10,6 +10,8 @@
     "src/db.ts",
     "src/capi.ts",
     "src/geo.ts",
+    "src/security.ts",
+    "src/jwt.ts",
     "src/scripts/**/*.ts",
     "src/migrations/**/*.ts"
   ]

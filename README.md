@@ -9,8 +9,8 @@ to Meta Conversions API.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Checks database connectivity |
-| `POST` | `/meta-pixel-access-tokens` | Registers a Meta pixel ID ↔ access token pair (requires `X-Admin-Token`) |
-| `PUT` | `/meta-pixel-access-tokens` | Rotates the token for an existing pixel (requires `X-Admin-Token`) |
+| `POST` | `/meta-pixel-access-tokens` | Registers a pixel (requires `X-Admin-Token`) |
+| `PUT` | `/meta-pixel-access-tokens` | Updates any pixel setting, including secret rotation (admin only) |
 | `POST` | `/:pixel_id/signals` | Public CAPI forwarding endpoint used by `sendBeacon` |
 
 Register a token:
@@ -23,7 +23,42 @@ curl -X POST https://signal.devalon.dev/meta-pixel-access-tokens \
 ```
 
 The access token is never returned by the API and never exposed to the browser.
-To rotate it, send the same body with `PUT /meta-pixel-access-tokens`.
+`PUT /meta-pixel-access-tokens` updates any setting on the same single row:
+
+```bash
+curl -X PUT https://signal.devalon.dev/meta-pixel-access-tokens \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Token: <secret>' \
+  -d '{"pixel_id":"YOUR_PIXEL_ID","origin":"https://ventprime.md","enforce_browser_checks":true,"rotate_signing_secret":true}'
+```
+
+All fields except `pixel_id` are optional. `origin: ""` clears it. When
+`rotate_signing_secret` is true, a new HMAC secret is generated, stored on the
+pixel row and returned **once** in the response — give it to the site's backend.
+
+## Signals endpoint protection
+
+The public `/:pixel_id/signals` endpoint has four optional layers. All values
+live on the single pixel row, so the route makes one database query.
+
+1. **Browser headers** — with `enforce_browser_checks: true`, requests must carry
+   `Origin`, `Sec-Fetch-Mode: no-cors`, `Sec-Fetch-Dest: empty` and a
+   cross-/same-site `Sec-Fetch-Site`. Plain REST clients don't send these.
+2. **Origin** — when `origin` is set on the pixel, the request `Origin` must match
+   it. One origin per pixel; an empty value leaves the endpoint open.
+3. **JWT** — when `signing_secret` is set, the site's backend mints short-lived
+   tokens with `createDevalonSignalJwt()` and passes them as `meta.jwt`. The
+   Worker verifies the HMAC signature and the `exp`, `pixel_id` and `origin`
+   claims. A stolen token expires within five minutes; a curl client without
+   the backend secret cannot mint a new one.
+4. **Rate limit** — 60 events per minute per `pixel_id` + IP, checked before the
+   database lookup. The map is in-memory and isolate-local (not global); a
+   distributed limit would need a Durable Object or KV. Returns `429`.
+
+Layers 1, 2 and 4 are filters: their values can be copied from a page. The JWT
+is the actual boundary — it is minted with a secret the browser never has, and
+it expires within five minutes. All layers are skipped when unconfigured, so
+existing integrations keep working.
 
 ## User data and privacy
 

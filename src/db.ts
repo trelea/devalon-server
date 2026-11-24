@@ -22,6 +22,9 @@ export interface Database {
     id: ColumnType<string, string, never>;
     pixel_id: string;
     access_token: string;
+    origin: ColumnType<string | null, string | null | undefined, string | null>;
+    signing_secret: ColumnType<string | null, string | null | undefined, string | null>;
+    enforce_browser_checks: ColumnType<number, number | undefined, number>;
     created_at: ColumnType<string, string | undefined, never>;
     updated_at: ColumnType<string, string | undefined, string>;
   };

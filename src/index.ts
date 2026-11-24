@@ -10,11 +10,13 @@ import {
   type SignalUserData,
 } from "./capi.js";
 import { get_db, type Env } from "./db.js";
+import { merge_geo_user_data, read_geo, resolve_external_geo } from "./geo.js";
 import {
-  merge_geo_user_data,
-  read_geo,
-  resolve_external_geo,
-} from "./geo.js";
+  allow_request,
+  has_browser_headers,
+  normalize_origin,
+} from "./security.js";
+import { verify_signal_jwt } from "./jwt.js";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -40,6 +42,15 @@ function constant_time_equal(a: string, b: string): boolean {
     difference |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return difference === 0;
+}
+
+function is_admin(c: {
+  req: { header: (name: string) => string | undefined };
+  env: Env;
+}): boolean {
+  const token = c.env.ADMIN_TOKEN;
+  const provided = c.req.header("x-admin-token");
+  return Boolean(token && provided && constant_time_equal(provided, token));
 }
 
 function is_unique_error(error: unknown): boolean {
@@ -152,14 +163,14 @@ app.post("/meta-pixel-access-tokens", async (c) => {
 
   const { pixel_id, access_token } = body;
 
-  if (!is_non_empty_string(pixel_id) || !PIXEL_ID_PATTERN.test(pixel_id.trim())) {
+  if (
+    !is_non_empty_string(pixel_id) ||
+    !PIXEL_ID_PATTERN.test(pixel_id.trim())
+  ) {
     log("warn", "token.rejected", { reason: "invalid_pixel_id" });
     return c.json({ error: "pixel_id must be a numeric Meta pixel ID" }, 400);
   }
-  if (
-    !is_non_empty_string(access_token) ||
-    access_token.trim().length > 4096
-  ) {
+  if (!is_non_empty_string(access_token) || access_token.trim().length > 4096) {
     log("warn", "token.rejected", {
       reason: "invalid_access_token",
       pixel_id: pixel_id.trim(),
@@ -218,20 +229,9 @@ app.post("/meta-pixel-access-tokens", async (c) => {
   );
 });
 
-/** Rotates the access token for an existing pixel. Requires X-Admin-Token. */
+/** Updates any setting for an existing pixel. Requires X-Admin-Token. */
 app.put("/meta-pixel-access-tokens", async (c) => {
-  const admin_token = c.env.ADMIN_TOKEN;
-
-  if (!admin_token) {
-    log("error", "token.rejected", { reason: "server_misconfigured" });
-    return c.json({ error: "Server is not configured" }, 500);
-  }
-
-  const provided = c.req.header("x-admin-token");
-  if (!provided || !constant_time_equal(provided, admin_token)) {
-    log("warn", "token.rejected", { reason: "unauthorized" });
-    return c.json({ error: "Unauthorized" }, 401);
-  }
+  if (!is_admin(c)) return c.json({ error: "Unauthorized" }, 401);
 
   let body: unknown;
   try {
@@ -243,48 +243,100 @@ app.put("/meta-pixel-access-tokens", async (c) => {
     return c.json({ error: "Request body must be a JSON object" }, 400);
   }
 
-  const { pixel_id, access_token } = body;
-  if (!is_non_empty_string(pixel_id) || !PIXEL_ID_PATTERN.test(pixel_id.trim())) {
-    log("warn", "token.rejected", { reason: "invalid_pixel_id" });
+  const {
+    pixel_id,
+    access_token,
+    origin,
+    enforce_browser_checks,
+    rotate_signing_secret,
+  } = body;
+  if (
+    !is_non_empty_string(pixel_id) ||
+    !PIXEL_ID_PATTERN.test(pixel_id.trim())
+  ) {
     return c.json({ error: "pixel_id must be a numeric Meta pixel ID" }, 400);
   }
-  if (!is_non_empty_string(access_token) || access_token.trim().length > 4096) {
-    log("warn", "token.rejected", {
-      reason: "invalid_access_token",
-      pixel_id: pixel_id.trim(),
-    });
+  if (
+    access_token !== undefined &&
+    (!is_non_empty_string(access_token) || access_token.trim().length > 4096)
+  ) {
     return c.json({ error: "access_token must be a non-empty string" }, 400);
   }
+  if (
+    origin !== undefined &&
+    origin !== null &&
+    origin !== "" &&
+    !is_non_empty_string(origin)
+  ) {
+    return c.json({ error: "origin must be a string or empty to clear" }, 400);
+  }
+  if (
+    enforce_browser_checks !== undefined &&
+    typeof enforce_browser_checks !== "boolean"
+  ) {
+    return c.json({ error: "enforce_browser_checks must be a boolean" }, 400);
+  }
+  if (
+    rotate_signing_secret !== undefined &&
+    typeof rotate_signing_secret !== "boolean"
+  ) {
+    return c.json({ error: "rotate_signing_secret must be a boolean" }, 400);
+  }
+
+  let normalized_origin: string | null | undefined;
+  if (origin === "" || origin === null) normalized_origin = null;
+  else if (origin !== undefined) {
+    const value = normalize_origin(origin);
+    if (!value)
+      return c.json(
+        { error: "origin must be an absolute http(s) origin" },
+        400,
+      );
+    normalized_origin = value;
+  }
+
+  const signing_secret =
+    rotate_signing_secret === true
+      ? `${crypto.randomUUID().replace(/-/g, "")}${crypto.randomUUID().replace(/-/g, "")}`
+      : undefined;
 
   const now = new Date().toISOString();
   const clean_pixel_id = pixel_id.trim();
+  const update: {
+    access_token?: string;
+    origin?: string | null;
+    signing_secret?: string;
+    enforce_browser_checks?: number;
+    updated_at: string;
+  } = { updated_at: now };
+  if (access_token !== undefined) update.access_token = access_token.trim();
+  if (normalized_origin !== undefined) update.origin = normalized_origin;
+  if (signing_secret !== undefined) update.signing_secret = signing_secret;
+  if (enforce_browser_checks !== undefined) {
+    update.enforce_browser_checks = enforce_browser_checks ? 1 : 0;
+  }
 
   try {
     const result = await get_db(c.env)
       .updateTable("meta_pixel_access_tokens")
-      .set({ access_token: access_token.trim(), updated_at: now })
+      .set(update)
       .where("pixel_id", "=", clean_pixel_id)
       .executeTakeFirst();
 
-    if (result && Number(result.numUpdatedRows) > 0) {
-      log("info", "token.updated", { pixel_id: clean_pixel_id });
-      return c.json({ pixel_id: clean_pixel_id, updated_at: now });
+    if (!result || Number(result.numUpdatedRows) === 0) {
+      return c.json({ error: "No token registered for this pixel" }, 404);
     }
 
-    log("warn", "token.rejected", {
-      reason: "not_found",
+    log("info", "token.updated", { pixel_id: clean_pixel_id });
+    return c.json({
       pixel_id: clean_pixel_id,
+      updated_at: now,
+      ...(signing_secret ? { signing_secret } : {}),
     });
-    return c.json({ error: "No token registered for this pixel" }, 404);
   } catch (error) {
     if (is_unique_error(error)) {
-      log("warn", "token.rejected", {
-        reason: "duplicate",
-        pixel_id: clean_pixel_id,
-      });
       return c.json({ error: "That access token is already in use" }, 409);
     }
-
     log("error", "token.rejected", {
       reason: "db_error",
       pixel_id: clean_pixel_id,
@@ -307,6 +359,14 @@ app.post("/:pixel_id/signals", async (c) => {
     return c.json({ error: "pixel_id must be a numeric Meta pixel ID" }, 400);
   }
 
+  const forwarded_for = c.req.header("x-forwarded-for");
+  const client_ip =
+    forwarded_for?.split(",")[0]?.trim() || c.req.header("x-real-ip");
+  if (!allow_request(`${pixel_id}:${client_ip ?? "unknown"}`)) {
+    log("warn", "signals.rejected", { reason: "rate_limited", pixel_id });
+    return c.json({ error: "Too many signals" }, 429);
+  }
+
   let raw_body: string;
   try {
     raw_body = await c.req.text();
@@ -327,21 +387,22 @@ app.post("/:pixel_id/signals", async (c) => {
     return c.json({ error: "Request body must be a JSON object" }, 400);
   }
 
-  const {
-    event_name,
-    event_id,
-    event_time,
-    params,
-    capi_test_event_code,
-  } = parsed;
+  const { event_name, event_id, event_time, params, capi_test_event_code } =
+    parsed;
 
   if (!is_non_empty_string(event_name) || !is_non_empty_string(event_id)) {
     log("warn", "signals.rejected", { reason: "invalid_event", pixel_id });
-    return c.json({ error: "event_name and event_id must be non-empty strings" }, 400);
+    return c.json(
+      { error: "event_name and event_id must be non-empty strings" },
+      400,
+    );
   }
   if (typeof event_time !== "number" || !Number.isInteger(event_time)) {
     log("warn", "signals.rejected", { reason: "invalid_event_time", pixel_id });
-    return c.json({ error: "event_time must be an integer Unix timestamp" }, 400);
+    return c.json(
+      { error: "event_time must be an integer Unix timestamp" },
+      400,
+    );
   }
 
   const now_s = Math.floor(Date.now() / 1000);
@@ -361,14 +422,29 @@ app.post("/:pixel_id/signals", async (c) => {
     (!is_non_empty_string(capi_test_event_code) ||
       !TEST_CODE_PATTERN.test(capi_test_event_code))
   ) {
-    return c.json({ error: "capi_test_event_code contains unsupported characters" }, 400);
+    return c.json(
+      { error: "capi_test_event_code contains unsupported characters" },
+      400,
+    );
   }
 
-  let token_row: { access_token: string } | undefined;
+  let token_row:
+    | {
+        access_token: string;
+        origin: string | null;
+        signing_secret: string | null;
+        enforce_browser_checks: number;
+      }
+    | undefined;
   try {
     token_row = await get_db(c.env)
       .selectFrom("meta_pixel_access_tokens")
-      .select("access_token")
+      .select([
+        "access_token",
+        "origin",
+        "signing_secret",
+        "enforce_browser_checks",
+      ])
       .where("pixel_id", "=", pixel_id)
       .executeTakeFirst();
   } catch (error) {
@@ -384,10 +460,48 @@ app.post("/:pixel_id/signals", async (c) => {
     return c.json({ error: "No access token registered for this pixel" }, 404);
   }
 
+  // Layer 1: browser-controlled fetch metadata. Off until enabled per pixel.
+  if (
+    token_row.enforce_browser_checks === 1 &&
+    !has_browser_headers(c.req.raw)
+  ) {
+    log("warn", "signals.rejected", { reason: "browser_headers", pixel_id });
+    return c.json({ error: "Browser request required" }, 403);
+  }
+
+  // One origin and one signing secret live on the pixel row itself.
+  const request_origin = c.req.header("origin");
+  const normalized_request_origin = request_origin
+    ? normalize_origin(request_origin)
+    : undefined;
+
+  if (token_row.origin && normalized_request_origin !== token_row.origin) {
+    log("warn", "signals.rejected", { reason: "origin", pixel_id });
+    return c.json({ error: "Origin not allowed" }, 403);
+  }
+
+  if (token_row.signing_secret) {
+    const verification = await verify_signal_jwt(
+      parsed.jwt,
+      token_row.signing_secret,
+      pixel_id,
+      request_origin,
+    );
+    if (!verification.ok) {
+      log("warn", "signals.rejected", {
+        reason: `jwt_${verification.reason}`,
+        pixel_id,
+      });
+      return c.json({ error: "Invalid or expired JWT" }, 403);
+    }
+  }
+
   // Geo fields are inferred at the edge for every forwarded event. Caller data
   // wins, so a supplied (or pre-hashed) value is never overwritten.
   const user_data = merge_geo_user_data(
-    parsed.user_data !== undefined ? parse_user_data(parsed.user_data) : undefined,
+    parsed.user_data !== undefined
+      ? parse_user_data(parsed.user_data)
+      : undefined,
     read_geo(c.req.raw),
   );
 
@@ -401,7 +515,9 @@ app.post("/:pixel_id/signals", async (c) => {
     ...(typeof parsed.event_source_url === "string"
       ? { event_source_url: parsed.event_source_url }
       : {}),
-    ...(typeof parsed.referrer === "string" ? { referrer: parsed.referrer } : {}),
+    ...(typeof parsed.referrer === "string"
+      ? { referrer: parsed.referrer }
+      : {}),
     ...(typeof parsed.user_agent === "string"
       ? { user_agent: parsed.user_agent }
       : {}),
@@ -419,16 +535,15 @@ app.post("/:pixel_id/signals", async (c) => {
       : {}),
   };
 
-  const forwarded_for = c.req.header("x-forwarded-for");
-  const client_ip = forwarded_for?.split(",")[0]?.trim() || c.req.header("x-real-ip");
-
   log("info", "signals.in", {
     pixel_id,
     event_name: payload.event_name,
     event_id: payload.event_id,
     has_fbp: Boolean(payload.fbp),
     has_fbc: Boolean(payload.fbc),
-    has_user_data: Boolean(payload.user_data && Object.keys(payload.user_data).length > 0),
+    has_user_data: Boolean(
+      payload.user_data && Object.keys(payload.user_data).length > 0,
+    ),
     event_source_url: payload.event_source_url ?? "",
   });
 
