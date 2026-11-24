@@ -5,7 +5,9 @@ import {
   CapiError,
   build_capi_event,
   send_to_meta,
+  type MetaCapiResult,
   type SignalPayload,
+  type SignalUserData,
 } from "./capi.js";
 import { get_db, type Env } from "./db.js";
 
@@ -40,6 +42,18 @@ function is_unique_error(error: unknown): boolean {
     (error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE" ||
     (error instanceof Error && /UNIQUE constraint failed/i.test(error.message))
   );
+}
+
+function parse_user_data(value: unknown): SignalUserData | undefined {
+  if (!is_object(value)) return undefined;
+
+  const user_data: SignalUserData = {};
+  for (const key of ["email", "phone", "externalId", "leadId"] as const) {
+    const field = value[key];
+    if (typeof field === "string" && field.trim()) user_data[key] = field;
+  }
+
+  return Object.keys(user_data).length > 0 ? user_data : undefined;
 }
 
 type LogLevel = "info" | "warn" | "error";
@@ -185,6 +199,82 @@ app.post("/meta-pixel-access-tokens", async (c) => {
   );
 });
 
+/** Rotates the access token for an existing pixel. Requires X-Admin-Token. */
+app.put("/meta-pixel-access-tokens", async (c) => {
+  const admin_token = c.env.ADMIN_TOKEN;
+
+  if (!admin_token) {
+    log("error", "token.rejected", { reason: "server_misconfigured" });
+    return c.json({ error: "Server is not configured" }, 500);
+  }
+
+  const provided = c.req.header("x-admin-token");
+  if (!provided || !constant_time_equal(provided, admin_token)) {
+    log("warn", "token.rejected", { reason: "unauthorized" });
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Request body must be valid JSON" }, 400);
+  }
+  if (!is_object(body)) {
+    return c.json({ error: "Request body must be a JSON object" }, 400);
+  }
+
+  const { pixel_id, access_token } = body;
+  if (!is_non_empty_string(pixel_id) || !PIXEL_ID_PATTERN.test(pixel_id.trim())) {
+    log("warn", "token.rejected", { reason: "invalid_pixel_id" });
+    return c.json({ error: "pixel_id must be a numeric Meta pixel ID" }, 400);
+  }
+  if (!is_non_empty_string(access_token) || access_token.trim().length > 4096) {
+    log("warn", "token.rejected", {
+      reason: "invalid_access_token",
+      pixel_id: pixel_id.trim(),
+    });
+    return c.json({ error: "access_token must be a non-empty string" }, 400);
+  }
+
+  const now = new Date().toISOString();
+  const clean_pixel_id = pixel_id.trim();
+
+  try {
+    const result = await get_db(c.env)
+      .updateTable("meta_pixel_access_tokens")
+      .set({ access_token: access_token.trim(), updated_at: now })
+      .where("pixel_id", "=", clean_pixel_id)
+      .executeTakeFirst();
+
+    if (result && Number(result.numUpdatedRows) > 0) {
+      log("info", "token.updated", { pixel_id: clean_pixel_id });
+      return c.json({ pixel_id: clean_pixel_id, updated_at: now });
+    }
+
+    log("warn", "token.rejected", {
+      reason: "not_found",
+      pixel_id: clean_pixel_id,
+    });
+    return c.json({ error: "No token registered for this pixel" }, 404);
+  } catch (error) {
+    if (is_unique_error(error)) {
+      log("warn", "token.rejected", {
+        reason: "duplicate",
+        pixel_id: clean_pixel_id,
+      });
+      return c.json({ error: "That access token is already in use" }, 409);
+    }
+
+    log("error", "token.rejected", {
+      reason: "db_error",
+      pixel_id: clean_pixel_id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return c.json({ error: "Internal server error" }, 500);
+  }
+});
+
 /**
  * Receives envelopes from `credits/src/signals/transport.ts` via sendBeacon
  * (text/plain body), then delivers them server-side through Meta CAPI.
@@ -292,12 +382,21 @@ app.post("/:pixel_id/signals", async (c) => {
     ...(typeof capi_test_event_code === "string"
       ? { capi_test_event_code }
       : {}),
+    ...(parsed.user_data !== undefined
+      ? { user_data: parse_user_data(parsed.user_data) }
+      : {}),
+    ...(typeof parsed.opt_out === "boolean" ? { opt_out: parsed.opt_out } : {}),
+    ...(Array.isArray(parsed.data_processing_options)
+      ? {
+          data_processing_options: parsed.data_processing_options.filter(
+            (item): item is string => typeof item === "string",
+          ),
+        }
+      : {}),
   };
 
   const forwarded_for = c.req.header("x-forwarded-for");
   const client_ip = forwarded_for?.split(",")[0]?.trim() || c.req.header("x-real-ip");
-
-  const { event, test_event_code } = build_capi_event(payload, client_ip);
 
   log("info", "signals.in", {
     pixel_id,
@@ -305,21 +404,45 @@ app.post("/:pixel_id/signals", async (c) => {
     event_id: payload.event_id,
     has_fbp: Boolean(payload.fbp),
     has_fbc: Boolean(payload.fbc),
+    has_user_data: Boolean(payload.user_data && Object.keys(payload.user_data).length > 0),
     event_source_url: payload.event_source_url ?? "",
   });
 
+  const config = {
+    base_url: c.env.META_GRAPH_API_BASE_URL,
+    version: c.env.META_GRAPH_API_VERSION,
+  };
+
   // Deliver to Meta after the response is sent. The browser uses sendBeacon
-  // and never reads the body, so a fast 202 is enough.
-  const delivery = send_to_meta(
-    pixel_id,
-    token_row.access_token,
-    event,
-    test_event_code,
-    {
-      base_url: c.env.META_GRAPH_API_BASE_URL,
-      version: c.env.META_GRAPH_API_VERSION,
-    },
-  ).then(
+  // and never reads the body, so a fast 202 is enough. One retry is safe
+  // because Meta deduplicates by event_id.
+  const deliver = async (): Promise<MetaCapiResult> => {
+    const { event, test_event_code } = await build_capi_event(payload, client_ip);
+
+    try {
+      return await send_to_meta(
+        pixel_id,
+        token_row.access_token,
+        event,
+        test_event_code,
+        config,
+      );
+    } catch (error) {
+      const status = error instanceof CapiError ? error.status : undefined;
+      if (status !== undefined && status < 500) throw error;
+
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return await send_to_meta(
+        pixel_id,
+        token_row.access_token,
+        event,
+        test_event_code,
+        config,
+      );
+    }
+  };
+
+  const delivery = deliver().then(
     (result) => {
       log("info", "capi.ok", {
         pixel_id,

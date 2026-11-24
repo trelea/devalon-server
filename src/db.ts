@@ -19,7 +19,7 @@ export interface Database {
     pixel_id: string;
     access_token: string;
     created_at: ColumnType<string, string | undefined, never>;
-    updated_at: ColumnType<string, string | undefined, never>;
+    updated_at: ColumnType<string, string | undefined, string>;
   };
 }
 

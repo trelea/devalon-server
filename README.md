@@ -10,6 +10,7 @@ to Meta Conversions API.
 | --- | --- | --- |
 | `GET` | `/health` | Checks database connectivity |
 | `POST` | `/meta-pixel-access-tokens` | Registers a Meta pixel ID ↔ access token pair (requires `X-Admin-Token`) |
+| `PUT` | `/meta-pixel-access-tokens` | Rotates the token for an existing pixel (requires `X-Admin-Token`) |
 | `POST` | `/:pixel_id/signals` | Public CAPI forwarding endpoint used by `sendBeacon` |
 
 Register a token:
@@ -22,6 +23,18 @@ curl -X POST https://signal.devalon.dev/meta-pixel-access-tokens \
 ```
 
 The access token is never returned by the API and never exposed to the browser.
+To rotate it, send the same body with `PUT /meta-pixel-access-tokens`.
+
+## User data and privacy
+
+The signals envelope may carry `user_data` with raw `email`, `phone`,
+`externalId` and `leadId`. The Worker normalizes and hashes them with SHA-256
+(`em`, `ph`, `external_id`, `lead_id`) before calling the Graph API. Values
+already hashed by the SDK's `hash_meta_user_data()` (64 hex characters) are
+passed through unchanged. `fbp`, `fbc`, `client_user_agent` and
+`client_ip_address` are sent raw, as Meta requires. The optional `opt_out` and
+`data_processing_options` fields are forwarded at event level. No PII is
+written to logs.
 
 ## Local development
 

@@ -6,6 +6,13 @@
  * the route and used only as a query parameter on the outbound request.
  */
 
+export interface SignalUserData {
+  email?: string;
+  phone?: string;
+  externalId?: string;
+  leadId?: string;
+}
+
 export interface SignalPayload {
   event_name: string;
   event_id: string;
@@ -26,6 +33,10 @@ export interface SignalPayload {
   viewport?: Record<string, unknown>;
   page_title?: string;
   sent_at?: string;
+  /** Raw PII from the app; normalized and hashed here before Meta. */
+  user_data?: SignalUserData;
+  opt_out?: boolean;
+  data_processing_options?: string[];
 }
 
 export interface MetaCapiEvent {
@@ -37,6 +48,8 @@ export interface MetaCapiEvent {
   user_data: Record<string, unknown>;
   custom_data?: Record<string, unknown>;
   order_id?: string;
+  opt_out?: boolean;
+  data_processing_options?: string[];
 }
 
 export interface MetaCapiResult {
@@ -47,11 +60,13 @@ export interface MetaCapiResult {
 
 export class CapiError extends Error {
   readonly details: unknown;
+  readonly status?: number;
 
-  constructor(message: string, details?: unknown) {
+  constructor(message: string, details?: unknown, status?: number) {
     super(message);
     this.name = "CapiError";
     this.details = details;
+    this.status = status;
   }
 }
 
@@ -71,21 +86,71 @@ const CUSTOM_DATA_KEYS = [
 ] as const;
 
 const TEST_CODE_PATTERN = /^[A-Za-z0-9_-]+$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
-export function build_capi_event(
+async function sha256(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function hash_field(
+  value: string | undefined,
+  normalize: (value: string) => string,
+): Promise<string | undefined> {
+  if (!value) return undefined;
+
+  const clean = normalize(value);
+  if (!clean) return undefined;
+
+  // Already hashed by the client (`hash_meta_user_data()`): do not hash twice.
+  return SHA256_HEX.test(clean) ? clean : await sha256(clean);
+}
+
+function normalize_email(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/** Keep the leading + and digits only. Callers should prefer E.164 numbers. */
+function normalize_phone(value: string): string {
+  return value.trim().replace(/[^\d+]/g, "");
+}
+
+/**
+ * Builds one Meta server event. PII is hashed here, at the boundary to Meta;
+ * fbp/fbc/IP/UA are deliberately left raw as Meta requires.
+ */
+export async function build_capi_event(
   payload: SignalPayload,
   client_ip?: string | undefined,
-): { event: MetaCapiEvent; test_event_code?: string } {
+): Promise<{ event: MetaCapiEvent; test_event_code?: string }> {
   const params = payload.params ?? {};
+  const raw_user_data = payload.user_data ?? {};
 
-  const user_data: Record<string, unknown> = {};
+  const [email, phone, external_id, lead_id] = await Promise.all([
+    hash_field(raw_user_data.email, normalize_email),
+    hash_field(raw_user_data.phone, normalize_phone),
+    hash_field(
+      raw_user_data.externalId ??
+        (typeof params.external_id === "string" ? params.external_id : undefined),
+      (value) => value.trim(),
+    ),
+    hash_field(raw_user_data.leadId, (value) => value.trim()),
+  ]);
+
+  const user_data: Record<string, unknown> = {
+    ...(email ? { em: [email] } : {}),
+    ...(phone ? { ph: [phone] } : {}),
+    ...(external_id ? { external_id } : {}),
+    ...(lead_id ? { lead_id } : {}),
+  };
   if (payload.user_agent) user_data.client_user_agent = payload.user_agent;
   if (payload.fbp) user_data.fbp = payload.fbp;
   if (payload.fbc) user_data.fbc = payload.fbc;
   if (client_ip) user_data.client_ip_address = client_ip;
-  if (typeof params.external_id === "string" && params.external_id) {
-    user_data.external_id = params.external_id;
-  }
 
   const custom_data: Record<string, unknown> = {};
   for (const key of CUSTOM_DATA_KEYS) {
@@ -94,6 +159,11 @@ export function build_capi_event(
   }
 
   const event_source_url = payload.event_source_url || payload.referrer || "";
+  const processing_options = Array.isArray(payload.data_processing_options)
+    ? payload.data_processing_options.filter(
+        (item): item is string => typeof item === "string",
+      )
+    : [];
 
   const event: MetaCapiEvent = {
     event_name: payload.event_name,
@@ -105,6 +175,10 @@ export function build_capi_event(
     ...(Object.keys(custom_data).length > 0 ? { custom_data } : {}),
     ...(typeof params.order_id === "string" && params.order_id
       ? { order_id: params.order_id }
+      : {}),
+    ...(typeof payload.opt_out === "boolean" ? { opt_out: payload.opt_out } : {}),
+    ...(processing_options.length > 0
+      ? { data_processing_options: processing_options }
       : {}),
   };
 
@@ -170,7 +244,7 @@ export async function send_to_meta(
       typeof graph_error?.message === "string" && graph_error.message
         ? graph_error.message
         : `Meta CAPI returned HTTP ${response.status}`;
-    throw new CapiError(message, raw);
+    throw new CapiError(message, raw, response.status);
   }
 
   if (!raw || typeof raw !== "object") {
