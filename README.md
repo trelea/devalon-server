@@ -19,7 +19,7 @@ Register a token:
 curl -X POST https://signal.devalon.dev/meta-pixel-access-tokens \
   -H 'Content-Type: application/json' \
   -H 'X-Admin-Token: <secret>' \
-  -d '{"pixel_id":"1683475309995701","access_token":"EA..."}'
+  -d '{"pixel_id":"YOUR_PIXEL_ID","access_token":"EA..."}'
 ```
 
 The access token is never returned by the API and never exposed to the browser.
