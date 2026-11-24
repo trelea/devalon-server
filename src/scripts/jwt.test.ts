@@ -51,6 +51,33 @@ describe("verify_signal_jwt", () => {
     assert.deepEqual(result, { ok: true });
   });
 
+  it("accepts an extra allowed origin only when provided", async () => {
+    const local_origin = "http://localhost:3000";
+    const token = sign(valid_payload({ origin: local_origin }));
+
+    assert.deepEqual(
+      await verify_signal_jwt(token, SECRET, PIXEL_ID, ORIGIN, NOW),
+      { ok: false, reason: "origin" },
+    );
+    assert.deepEqual(
+      await verify_signal_jwt(token, SECRET, PIXEL_ID, ORIGIN, NOW, {
+        allowed_origins: [local_origin],
+      }),
+      { ok: true },
+    );
+    assert.deepEqual(
+      await verify_signal_jwt(
+        sign(valid_payload({ origin: "http://evil.example" })),
+        SECRET,
+        PIXEL_ID,
+        ORIGIN,
+        NOW,
+        { allowed_origins: [local_origin] },
+      ),
+      { ok: false, reason: "origin" },
+    );
+  });
+
   it("rejects a bad signature", async () => {
     const token = sign(valid_payload(), "a-different-long-secret-value");
     const result = await verify_signal_jwt(token, SECRET, PIXEL_ID, ORIGIN, NOW);

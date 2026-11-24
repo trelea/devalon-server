@@ -72,6 +72,11 @@ function reject(reason: JwtRejectReason): JwtVerification {
   return { ok: false, reason };
 }
 
+export interface JwtVerificationOptions {
+  /** Extra origins (e.g. a registered production origin) allowed in dev mode. */
+  allowed_origins?: string[];
+}
+
 /** Verifies signature, expiry, pixel binding and origin binding. */
 export async function verify_signal_jwt(
   token: unknown,
@@ -79,6 +84,7 @@ export async function verify_signal_jwt(
   pixel_id: string,
   request_origin: string | undefined,
   now_seconds: number = Math.floor(Date.now() / 1000),
+  options: JwtVerificationOptions = {},
 ): Promise<JwtVerification> {
   if (typeof token !== "string" || token.length > 4096) return reject("malformed");
 
@@ -124,7 +130,13 @@ export async function verify_signal_jwt(
 
   const expected_origin = request_origin ? normalize_origin(request_origin) : undefined;
   const token_origin = typeof claim_origin === "string" ? normalize_origin(claim_origin) : undefined;
-  if (!expected_origin || !token_origin || expected_origin !== token_origin) {
+  const accepted_origins = [
+    ...(expected_origin ? [expected_origin] : []),
+    ...(options.allowed_origins ?? [])
+      .map((origin) => normalize_origin(origin))
+      .filter((origin): origin is string => Boolean(origin)),
+  ];
+  if (!token_origin || !accepted_origins.includes(token_origin)) {
     return reject("origin");
   }
 

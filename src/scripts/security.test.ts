@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import {
   allow_request,
   has_browser_headers,
+  is_dev_origin,
   normalize_origin,
   reset_rate_limits,
 } from "../security.js";
@@ -43,9 +44,13 @@ describe("has_browser_headers", () => {
     assert.equal(has_browser_headers(beacon_request()), true);
   });
 
+  it("accepts keepalive fetch (cors) requests", () => {
+    assert.equal(has_browser_headers(beacon_request({ "Sec-Fetch-Mode": "cors" })), true);
+  });
+
   it("rejects plain REST clients and wrong fetch metadata", () => {
     assert.equal(has_browser_headers(new Request("https://signal.devalon.dev/x")), false);
-    assert.equal(has_browser_headers(beacon_request({ "Sec-Fetch-Mode": "cors" })), false);
+    assert.equal(has_browser_headers(beacon_request({ "Sec-Fetch-Mode": "navigate" })), false);
     assert.equal(has_browser_headers(beacon_request({ Origin: "" })), false);
   });
 
@@ -54,6 +59,38 @@ describe("has_browser_headers", () => {
       has_browser_headers(beacon_request({ "Sec-Fetch-Site": "same-site" })),
       true,
     );
+  });
+});
+
+describe("is_dev_origin", () => {
+  it("accepts loopback and private IPv4 origins on any port", () => {
+    for (const origin of [
+      "http://localhost:3000",
+      "http://app.localhost:5173",
+      "http://127.0.0.1:3000",
+      "http://[::1]:3000",
+      "http://10.0.0.5:3000",
+      "http://172.16.2.3:8080",
+      "http://172.31.255.254:3000",
+      "http://192.168.1.50:3000",
+      "https://localhost:3443",
+    ]) {
+      assert.equal(is_dev_origin(origin), true, origin);
+    }
+  });
+
+  it("rejects public origins, other schemes and missing values", () => {
+    for (const origin of [
+      "https://ventprime.md",
+      "http://example.com:3000",
+      "http://172.32.0.1:3000",
+      "http://192.169.0.1:3000",
+      "file:///tmp/index.html",
+      "not a url",
+      undefined,
+    ]) {
+      assert.equal(is_dev_origin(origin), false, String(origin));
+    }
   });
 });
 

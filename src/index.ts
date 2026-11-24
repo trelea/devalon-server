@@ -14,9 +14,11 @@ import { merge_geo_user_data, read_geo, resolve_external_geo } from "./geo.js";
 import {
   allow_request,
   has_browser_headers,
+  is_dev_origin,
   normalize_origin,
 } from "./security.js";
 import { verify_signal_jwt } from "./jwt.js";
+import { read_signal_jwt } from "./signal-jwt.js";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -106,13 +108,13 @@ function log(
   else console.info(line);
 }
 
-/** sendBeacon uses no-cors; expose the response so DevTools shows 200, not Blocked. */
+/** Keepalive fetch uses cors; answer its preflight and expose the response. */
 app.use("/:pixel_id/signals", async (c, next) => {
   const origin = c.req.header("Origin");
 
   c.header("Access-Control-Allow-Origin", origin ?? "*");
   c.header("Access-Control-Allow-Methods", "POST, OPTIONS");
-  c.header("Access-Control-Allow-Headers", "Content-Type");
+  c.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   c.header("Vary", "Origin");
 
   if (c.req.method === "OPTIONS") return c.body(null, 204);
@@ -254,13 +256,15 @@ app.patch("/meta-pixel-access-tokens/:pixel_id", async (c) => {
     enforce_browser_checks,
     rotate_signing_secret,
     signing_secret,
+    allow_dev_origins,
   } = body;
   if (
     access_token === undefined &&
     origin === undefined &&
     enforce_browser_checks === undefined &&
     rotate_signing_secret === undefined &&
-    signing_secret === undefined
+    signing_secret === undefined &&
+    allow_dev_origins === undefined
   ) {
     return c.json({ error: "No updatable fields supplied" }, 400);
   }
@@ -289,6 +293,12 @@ app.patch("/meta-pixel-access-tokens/:pixel_id", async (c) => {
     typeof rotate_signing_secret !== "boolean"
   ) {
     return c.json({ error: "rotate_signing_secret must be a boolean" }, 400);
+  }
+  if (
+    allow_dev_origins !== undefined &&
+    typeof allow_dev_origins !== "boolean"
+  ) {
+    return c.json({ error: "allow_dev_origins must be a boolean" }, 400);
   }
   if (
     signing_secret !== undefined &&
@@ -324,6 +334,7 @@ app.patch("/meta-pixel-access-tokens/:pixel_id", async (c) => {
     origin?: string | null;
     signing_secret?: string;
     enforce_browser_checks?: number;
+    allow_dev_origins?: number;
     updated_at: string;
   } = { updated_at: now };
   if (access_token !== undefined) update.access_token = access_token.trim();
@@ -331,6 +342,9 @@ app.patch("/meta-pixel-access-tokens/:pixel_id", async (c) => {
   if (updated_secret !== undefined) update.signing_secret = updated_secret;
   if (enforce_browser_checks !== undefined) {
     update.enforce_browser_checks = enforce_browser_checks ? 1 : 0;
+  }
+  if (allow_dev_origins !== undefined) {
+    update.allow_dev_origins = allow_dev_origins ? 1 : 0;
   }
 
   try {
@@ -364,9 +378,10 @@ app.patch("/meta-pixel-access-tokens/:pixel_id", async (c) => {
 });
 
 /**
- * Receives envelopes from `credits/src/signals/transport.ts` via sendBeacon
- * (text/plain body), then delivers them server-side through Meta CAPI.
- * The browser event_id is preserved so Meta can deduplicate the two channels.
+ * Receives envelopes from `credits/src/signals/transport.ts` via keepalive
+ * fetch, with the JWT in an Authorization header, then delivers them
+ * server-side through Meta CAPI. The browser event_id is preserved so Meta
+ * can deduplicate the two channels.
  */
 app.post("/:pixel_id/signals", async (c) => {
   const pixel_id = c.req.param("pixel_id");
@@ -451,6 +466,7 @@ app.post("/:pixel_id/signals", async (c) => {
         origin: string | null;
         signing_secret: string | null;
         enforce_browser_checks: number;
+        allow_dev_origins: number;
       }
     | undefined;
   try {
@@ -461,6 +477,7 @@ app.post("/:pixel_id/signals", async (c) => {
         "origin",
         "signing_secret",
         "enforce_browser_checks",
+        "allow_dev_origins",
       ])
       .where("pixel_id", "=", pixel_id)
       .executeTakeFirst();
@@ -491,18 +508,39 @@ app.post("/:pixel_id/signals", async (c) => {
   const normalized_request_origin = request_origin
     ? normalize_origin(request_origin)
     : undefined;
+  const dev_origin_allowed =
+    token_row.allow_dev_origins === 1 && is_dev_origin(normalized_request_origin);
 
-  if (token_row.origin && normalized_request_origin !== token_row.origin) {
+  if (
+    token_row.origin &&
+    normalized_request_origin !== token_row.origin &&
+    !dev_origin_allowed
+  ) {
     log("warn", "signals.rejected", { reason: "origin", pixel_id });
     return c.json({ error: "Origin not allowed" }, 403);
   }
 
+  const { token: jwt_token, from_body } = read_signal_jwt(c, parsed);
+  if (from_body) {
+    log("warn", "signals.deprecated", {
+      reason: "jwt_in_body",
+      pixel_id,
+    });
+  }
+
   if (token_row.signing_secret) {
     const verification = await verify_signal_jwt(
-      parsed.jwt,
+      jwt_token,
       token_row.signing_secret,
       pixel_id,
       request_origin,
+      undefined,
+      {
+        // Local testing may mint a token for the dev origin or keep the
+        // production origin; both are acceptable only when enabled by admin.
+        allowed_origins:
+          dev_origin_allowed && token_row.origin ? [token_row.origin] : [],
+      },
     );
     if (!verification.ok) {
       const code = `jwt_${verification.reason}`;
@@ -560,6 +598,7 @@ app.post("/:pixel_id/signals", async (c) => {
       payload.user_data && Object.keys(payload.user_data).length > 0,
     ),
     event_source_url: payload.event_source_url ?? "",
+    ...(dev_origin_allowed ? { dev_origin: true } : {}),
   });
 
   const config = {

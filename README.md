@@ -11,7 +11,7 @@ to Meta Conversions API.
 | `GET` | `/health` | Checks database connectivity |
 | `POST` | `/meta-pixel-access-tokens` | Registers a pixel (requires `X-Admin-Token`) |
 | `PATCH` | `/meta-pixel-access-tokens/:pixel_id` | Partially updates a pixel, including secret rotation (admin only) |
-| `POST` | `/:pixel_id/signals` | Public CAPI forwarding endpoint used by `sendBeacon` |
+| `POST` | `/:pixel_id/signals` | Public CAPI forwarding endpoint used by the SDK's keepalive `fetch` |
 
 Register a token:
 
@@ -33,8 +33,9 @@ curl -X PATCH https://signal.devalon.dev/meta-pixel-access-tokens/YOUR_PIXEL_ID 
 ```
 
 Accepted fields: `access_token`, `origin` (`""` clears it),
-`enforce_browser_checks`, `rotate_signing_secret`, and `signing_secret` (supply
-your own value instead of rotating). Omitted fields stay unchanged; a body with
+`enforce_browser_checks`, `allow_dev_origins`, `rotate_signing_secret`, and
+`signing_secret` (supply your own value instead of rotating). Omitted fields
+stay unchanged; a body with
 no recognized fields returns `400`. Both secret options return the value **once**
 in the response — give it to the site's backend. If both are supplied,
 `signing_secret` wins.
@@ -45,15 +46,21 @@ The public `/:pixel_id/signals` endpoint has four optional layers. All values
 live on the single pixel row, so the route makes one database query.
 
 1. **Browser headers** — with `enforce_browser_checks: true`, requests must carry
-   `Origin`, `Sec-Fetch-Mode: no-cors`, `Sec-Fetch-Dest: empty` and a
-   cross-/same-site `Sec-Fetch-Site`. Plain REST clients don't send these.
+   `Origin`, `Sec-Fetch-Dest: empty`, a cross-/same-site `Sec-Fetch-Site`, and
+   `Sec-Fetch-Mode` of `cors` (keepalive `fetch`) or `no-cors` (`sendBeacon`).
+   Plain REST clients don't send these.
 2. **Origin** — when `origin` is set on the pixel, the request `Origin` must match
-   it. One origin per pixel; an empty value leaves the endpoint open.
+   it. One origin per pixel; an empty value leaves the endpoint open. With
+   `allow_dev_origins: true`, loopback and private IPv4 origins are also accepted
+   (see below).
 3. **JWT** — when `signing_secret` is set, the site's backend mints short-lived
-   tokens with `createDevalonSignalJwt()` and passes them as `meta.jwt`. The
-   Worker verifies the HMAC signature and the `exp`, `pixel_id` and `origin`
-   claims. A stolen token expires within five minutes; a curl client without
-   the backend secret cannot mint a new one.
+   tokens with `createDevalonSignalJwt()` and passes them as `meta.jwt`. The SDK
+   sends them as `Authorization: Bearer <token>`; a token in the envelope is
+   accepted only as a temporary fallback for older SDK versions and logs
+   `signals.deprecated` with `reason: jwt_in_body`. The Worker verifies the HMAC
+   signature and the `exp`, `pixel_id` and `origin` claims. A stolen token
+   expires within five minutes; a curl client without the backend secret cannot
+   mint a new one.
 4. **Rate limit** — 60 events per minute per `pixel_id` + IP, checked before the
    database lookup. The map is in-memory and isolate-local (not global); a
    distributed limit would need a Durable Object or KV. Returns `429`.
@@ -62,6 +69,34 @@ Layers 1, 2 and 4 are filters: their values can be copied from a page. The JWT
 is the actual boundary — it is minted with a secret the browser never has, and
 it expires within five minutes. All layers are skipped when unconfigured, so
 existing integrations keep working.
+
+### Development origins
+
+`allow_dev_origins` is an admin-only, per-pixel switch for testing from a local
+machine. When enabled, the origin check additionally accepts loopback hosts
+(`localhost`, `*.localhost`, `127.0.0.1`, `::1`) and private IPv4 addresses
+(`10/8`, `172.16/12`, `192.168/16`) on any port. JWT origin binding also accepts
+a token minted for the local origin, or for the registered production origin,
+when the request comes from one of those addresses. Public origins never match
+and the switch is off by default.
+
+```bash
+# Enable for testing
+curl -X PATCH https://signal.devalon.dev/meta-pixel-access-tokens/YOUR_PIXEL_ID \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Token: <secret>' \
+  -d '{"allow_dev_origins":true}'
+
+# Disable when done
+curl -X PATCH https://signal.devalon.dev/meta-pixel-access-tokens/YOUR_PIXEL_ID \
+  -H 'Content-Type: application/json' \
+  -H 'X-Admin-Token: <secret>' \
+  -d '{"allow_dev_origins":false}'
+```
+
+Accepted events carry `dev_origin: true` in `signals.in`. Leave the switch off
+in production: while it is on, anyone on those local/private addresses can post
+events with a valid short-lived token.
 
 ## User data and privacy
 
@@ -146,8 +181,9 @@ yarn deploy
 ## Logs
 
 The Worker emits one JSON line per event: `signals.in`, `capi.ok`, `capi.fail`,
-`token.created`, `token.missing`, `token.rejected`, `signals.rejected`. Tokens
-and raw event params are never logged. Watch them live with:
+`token.created`, `token.missing`, `token.rejected`, `signals.rejected`, and
+`signals.deprecated` (legacy JWT in the envelope). Tokens and raw event params
+are never logged. Watch them live with:
 
 ```bash
 npx wrangler tail devalon-server

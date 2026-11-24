@@ -15,9 +15,9 @@ export function normalize_origin(value: string): string | undefined {
 }
 
 /**
- * `sendBeacon` sends these browser-controlled headers; plain HTTP clients do
- * not. A client can forge them, so this filters casual abuse rather than
- * providing authentication.
+ * Browser-controlled fetch metadata; plain HTTP clients do not send these.
+ * `no-cors` comes from sendBeacon, `cors` from the SDK's keepalive fetch.
+ * A client can forge them, so this filters casual abuse, not authentication.
  */
 export function has_browser_headers(req: Request): boolean {
   const origin = req.headers.get("origin");
@@ -27,10 +27,39 @@ export function has_browser_headers(req: Request): boolean {
 
   return (
     Boolean(origin) &&
-    mode === "no-cors" &&
+    (mode === "no-cors" || mode === "cors") &&
     dest === "empty" &&
     (site === "cross-site" || site === "same-site")
   );
+}
+
+const PRIVATE_IPV4 = [
+  /^127\./,
+  /^10\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /^192\.168\./,
+];
+
+/**
+ * Recognizes local/private origins used for development: loopback hosts and
+ * RFC1918 IPv4 addresses on any port. Admin-enabled per pixel; public origins
+ * never match, so this can only widen access when explicitly switched on.
+ */
+export function is_dev_origin(origin: string | undefined): boolean {
+  if (!origin) return false;
+
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+
+  const host = url.hostname.toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host === "[::1]") return true;
+  return PRIVATE_IPV4.some((pattern) => pattern.test(host));
 }
 
 interface RateBucket {
