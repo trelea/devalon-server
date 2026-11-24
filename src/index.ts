@@ -667,7 +667,7 @@ app.post("/:pixel_id/signals", async (c) => {
     await delivery;
   }
 
-  return c.json({ status: "accepted" }, 202);
+  return c.body(null, 202);
 });
 
 export default app;
