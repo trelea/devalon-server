@@ -10,7 +10,7 @@ to Meta Conversions API.
 | --- | --- | --- |
 | `GET` | `/health` | Checks database connectivity |
 | `POST` | `/meta-pixel-access-tokens` | Registers a pixel (requires `X-Admin-Token`) |
-| `PUT` | `/meta-pixel-access-tokens` | Updates any pixel setting, including secret rotation (admin only) |
+| `PATCH` | `/meta-pixel-access-tokens/:pixel_id` | Partially updates a pixel, including secret rotation (admin only) |
 | `POST` | `/:pixel_id/signals` | Public CAPI forwarding endpoint used by `sendBeacon` |
 
 Register a token:
@@ -23,18 +23,21 @@ curl -X POST https://signal.devalon.dev/meta-pixel-access-tokens \
 ```
 
 The access token is never returned by the API and never exposed to the browser.
-`PUT /meta-pixel-access-tokens` updates any setting on the same single row:
+`PATCH /meta-pixel-access-tokens/:pixel_id` updates only the fields you send:
 
 ```bash
-curl -X PUT https://signal.devalon.dev/meta-pixel-access-tokens \
+curl -X PATCH https://signal.devalon.dev/meta-pixel-access-tokens/YOUR_PIXEL_ID \
   -H 'Content-Type: application/json' \
   -H 'X-Admin-Token: <secret>' \
-  -d '{"pixel_id":"YOUR_PIXEL_ID","origin":"https://ventprime.md","enforce_browser_checks":true,"rotate_signing_secret":true}'
+  -d '{"origin":"https://ventprime.md","enforce_browser_checks":true,"rotate_signing_secret":true}'
 ```
 
-All fields except `pixel_id` are optional. `origin: ""` clears it. When
-`rotate_signing_secret` is true, a new HMAC secret is generated, stored on the
-pixel row and returned **once** in the response — give it to the site's backend.
+Accepted fields: `access_token`, `origin` (`""` clears it),
+`enforce_browser_checks`, `rotate_signing_secret`, and `signing_secret` (supply
+your own value instead of rotating). Omitted fields stay unchanged; a body with
+no recognized fields returns `400`. Both secret options return the value **once**
+in the response — give it to the site's backend. If both are supplied,
+`signing_secret` wins.
 
 ## Signals endpoint protection
 

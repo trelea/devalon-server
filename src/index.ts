@@ -229,9 +229,14 @@ app.post("/meta-pixel-access-tokens", async (c) => {
   );
 });
 
-/** Updates any setting for an existing pixel. Requires X-Admin-Token. */
-app.put("/meta-pixel-access-tokens", async (c) => {
+/** Partially updates a pixel identified by the path. Requires X-Admin-Token. */
+app.patch("/meta-pixel-access-tokens/:pixel_id", async (c) => {
   if (!is_admin(c)) return c.json({ error: "Unauthorized" }, 401);
+
+  const pixel_id = c.req.param("pixel_id");
+  if (!PIXEL_ID_PATTERN.test(pixel_id)) {
+    return c.json({ error: "pixel_id must be a numeric Meta pixel ID" }, 400);
+  }
 
   let body: unknown;
   try {
@@ -244,17 +249,20 @@ app.put("/meta-pixel-access-tokens", async (c) => {
   }
 
   const {
-    pixel_id,
     access_token,
     origin,
     enforce_browser_checks,
     rotate_signing_secret,
+    signing_secret,
   } = body;
   if (
-    !is_non_empty_string(pixel_id) ||
-    !PIXEL_ID_PATTERN.test(pixel_id.trim())
+    access_token === undefined &&
+    origin === undefined &&
+    enforce_browser_checks === undefined &&
+    rotate_signing_secret === undefined &&
+    signing_secret === undefined
   ) {
-    return c.json({ error: "pixel_id must be a numeric Meta pixel ID" }, 400);
+    return c.json({ error: "No updatable fields supplied" }, 400);
   }
   if (
     access_token !== undefined &&
@@ -282,6 +290,12 @@ app.put("/meta-pixel-access-tokens", async (c) => {
   ) {
     return c.json({ error: "rotate_signing_secret must be a boolean" }, 400);
   }
+  if (
+    signing_secret !== undefined &&
+    (!is_non_empty_string(signing_secret) || signing_secret.length > 4096)
+  ) {
+    return c.json({ error: "signing_secret must be a non-empty string" }, 400);
+  }
 
   let normalized_origin: string | null | undefined;
   if (origin === "" || origin === null) normalized_origin = null;
@@ -295,10 +309,13 @@ app.put("/meta-pixel-access-tokens", async (c) => {
     normalized_origin = value;
   }
 
-  const signing_secret =
-    rotate_signing_secret === true
-      ? `${crypto.randomUUID().replace(/-/g, "")}${crypto.randomUUID().replace(/-/g, "")}`
-      : undefined;
+  // An explicit secret wins over rotation; only one can be applied.
+  const updated_secret =
+    signing_secret !== undefined
+      ? signing_secret.trim()
+      : rotate_signing_secret === true
+        ? `${crypto.randomUUID().replace(/-/g, "")}${crypto.randomUUID().replace(/-/g, "")}`
+        : undefined;
 
   const now = new Date().toISOString();
   const clean_pixel_id = pixel_id.trim();
@@ -311,7 +328,7 @@ app.put("/meta-pixel-access-tokens", async (c) => {
   } = { updated_at: now };
   if (access_token !== undefined) update.access_token = access_token.trim();
   if (normalized_origin !== undefined) update.origin = normalized_origin;
-  if (signing_secret !== undefined) update.signing_secret = signing_secret;
+  if (updated_secret !== undefined) update.signing_secret = updated_secret;
   if (enforce_browser_checks !== undefined) {
     update.enforce_browser_checks = enforce_browser_checks ? 1 : 0;
   }
@@ -331,7 +348,7 @@ app.put("/meta-pixel-access-tokens", async (c) => {
     return c.json({
       pixel_id: clean_pixel_id,
       updated_at: now,
-      ...(signing_secret ? { signing_secret } : {}),
+      ...(updated_secret ? { signing_secret: updated_secret } : {}),
     });
   } catch (error) {
     if (is_unique_error(error)) {
