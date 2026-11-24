@@ -10,6 +10,11 @@ import {
   type SignalUserData,
 } from "./capi.js";
 import { get_db, type Env } from "./db.js";
+import {
+  merge_geo_user_data,
+  read_geo,
+  resolve_external_geo,
+} from "./geo.js";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -48,7 +53,21 @@ function parse_user_data(value: unknown): SignalUserData | undefined {
   if (!is_object(value)) return undefined;
 
   const user_data: SignalUserData = {};
-  for (const key of ["email", "phone", "externalId", "leadId"] as const) {
+  for (const key of [
+    "email",
+    "phone",
+    "externalId",
+    "leadId",
+    "name",
+    "firstName",
+    "lastName",
+    "ge",
+    "db",
+    "ct",
+    "st",
+    "zp",
+    "country",
+  ] as const) {
     const field = value[key];
     if (typeof field === "string" && field.trim()) user_data[key] = field;
   }
@@ -365,6 +384,13 @@ app.post("/:pixel_id/signals", async (c) => {
     return c.json({ error: "No access token registered for this pixel" }, 404);
   }
 
+  // Geo fields are inferred at the edge for every forwarded event. Caller data
+  // wins, so a supplied (or pre-hashed) value is never overwritten.
+  const user_data = merge_geo_user_data(
+    parsed.user_data !== undefined ? parse_user_data(parsed.user_data) : undefined,
+    read_geo(c.req.raw),
+  );
+
   const payload: SignalPayload = {
     event_name: event_name.trim(),
     event_id: event_id.trim(),
@@ -382,9 +408,7 @@ app.post("/:pixel_id/signals", async (c) => {
     ...(typeof capi_test_event_code === "string"
       ? { capi_test_event_code }
       : {}),
-    ...(parsed.user_data !== undefined
-      ? { user_data: parse_user_data(parsed.user_data) }
-      : {}),
+    ...(user_data ? { user_data } : {}),
     ...(typeof parsed.opt_out === "boolean" ? { opt_out: parsed.opt_out } : {}),
     ...(Array.isArray(parsed.data_processing_options)
       ? {
@@ -417,7 +441,14 @@ app.post("/:pixel_id/signals", async (c) => {
   // and never reads the body, so a fast 202 is enough. One retry is safe
   // because Meta deduplicates by event_id.
   const deliver = async (): Promise<MetaCapiResult> => {
-    const { event, test_event_code } = await build_capi_event(payload, client_ip);
+    // Runs after the 202 response: fill any geo gaps Cloudflare left, then
+    // build the event with the same normalization and hashing as always.
+    const external_geo = await resolve_external_geo(client_ip ?? "", c.env);
+    const enriched = merge_geo_user_data(payload.user_data, external_geo);
+    const { event, test_event_code } = await build_capi_event(
+      { ...payload, user_data: enriched },
+      client_ip,
+    );
 
     try {
       return await send_to_meta(

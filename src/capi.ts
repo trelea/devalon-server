@@ -10,7 +10,18 @@ export interface SignalUserData {
   email?: string;
   phone?: string;
   externalId?: string;
+  /** Meta requires lead_id verbatim; never hashed. */
   leadId?: string;
+  /** Alias for firstName, for single-name form fields. */
+  name?: string;
+  firstName?: string;
+  lastName?: string;
+  ge?: string;
+  db?: string;
+  ct?: string;
+  st?: string;
+  zp?: string;
+  country?: string;
 }
 
 export interface SignalPayload {
@@ -89,7 +100,10 @@ const CUSTOM_DATA_KEYS = [
 ] as const;
 
 const TEST_CODE_PATTERN = /^[A-Za-z0-9_-]+$/;
-const SHA256_HEX = /^[0-9a-f]{64}$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/i;
+const PUNCTUATION_OR_SYMBOL = /\p{P}|\p{S}/gu;
+const NON_ALPHANUMERIC_OR_SPACE = /[\p{P}\p{S}\s]/gu;
+const NON_LETTER = /[^\p{L}]/gu;
 
 async function sha256(value: string): Promise<string> {
   const bytes = new TextEncoder().encode(value);
@@ -106,25 +120,59 @@ async function hash_field(
 ): Promise<string | undefined> {
   if (!value) return undefined;
 
-  const clean = normalize(value);
+  // Trim before the hex check so a stray newline cannot cause double hashing.
+  const clean = normalize(value).trim();
   if (!clean) return undefined;
 
   // Already hashed by the client (`hash_meta_user_data()`): do not hash twice.
-  return SHA256_HEX.test(clean) ? clean : await sha256(clean);
+  // Uppercase hex is accepted too, canonicalized to lowercase.
+  if (SHA256_HEX.test(clean)) return clean.toLowerCase();
+  return await sha256(clean);
 }
 
 function normalize_email(value: string): string {
   return value.trim().toLowerCase();
 }
 
-/** Keep the leading + and digits only. Callers should prefer E.164 numbers. */
+/** Digits only, including country code; leading zeros dropped. */
 function normalize_phone(value: string): string {
-  return value.trim().replace(/[^\d+]/g, "");
+  return value.replace(/\D/g, "").replace(/^0+/, "");
+}
+
+/** Lowercase, no punctuation; UTF-8 letters such as `é` are preserved. */
+function normalize_name(value: string): string {
+  return value.replace(PUNCTUATION_OR_SYMBOL, "").trim().toLowerCase();
+}
+
+function normalize_gender(value: string): string {
+  const clean = value.trim().toLowerCase();
+  return clean === "f" || clean === "m" ? clean : "";
+}
+
+/** Meta expects YYYYMMDD; non-digits are stripped and invalid lengths skipped. */
+function normalize_date_of_birth(value: string): string {
+  const clean = value.replace(/\D/g, "");
+  return /^\d{8}$/.test(clean) ? clean : "";
+}
+
+/** City/state/zip: lowercase, no punctuation, symbols or spaces. */
+function normalize_compact(value: string): string {
+  return value.replace(NON_ALPHANUMERIC_OR_SPACE, "").toLowerCase();
+}
+
+/** Lowercase two-letter ISO 3166-1 alpha-2 code. */
+function normalize_country(value: string): string {
+  return value.replace(NON_LETTER, "").toLowerCase();
+}
+
+function normalize_id(value: string): string {
+  return value.trim();
 }
 
 /**
- * Builds one Meta server event. PII is hashed here, at the boundary to Meta;
- * fbp/fbc/IP/UA are deliberately left raw as Meta requires.
+ * Builds one Meta server event. PII is normalized and hashed here, at the
+ * boundary to Meta; fbp/fbc/IP/UA and lead_id are deliberately left raw as
+ * Meta requires. All hashes are computed in one parallel batch.
  */
 export async function build_capi_event(
   payload: SignalPayload,
@@ -133,22 +181,50 @@ export async function build_capi_event(
   const params = payload.params ?? {};
   const raw_user_data = payload.user_data ?? {};
 
-  const [email, phone, external_id, lead_id] = await Promise.all([
+  const [
+    email,
+    phone,
+    external_id,
+    first_name,
+    last_name,
+    gender,
+    birthdate,
+    city,
+    state,
+    zip,
+    country_code,
+  ] = await Promise.all([
     hash_field(raw_user_data.email, normalize_email),
     hash_field(raw_user_data.phone, normalize_phone),
     hash_field(
       raw_user_data.externalId ??
         (typeof params.external_id === "string" ? params.external_id : undefined),
-      (value) => value.trim(),
+      normalize_id,
     ),
-    hash_field(raw_user_data.leadId, (value) => value.trim()),
+    hash_field(raw_user_data.firstName ?? raw_user_data.name, normalize_name),
+    hash_field(raw_user_data.lastName, normalize_name),
+    hash_field(raw_user_data.ge, normalize_gender),
+    hash_field(raw_user_data.db, normalize_date_of_birth),
+    hash_field(raw_user_data.ct, normalize_compact),
+    hash_field(raw_user_data.st, normalize_compact),
+    hash_field(raw_user_data.zp, normalize_compact),
+    hash_field(raw_user_data.country, normalize_country),
   ]);
 
   const user_data: Record<string, unknown> = {
     ...(email ? { em: [email] } : {}),
     ...(phone ? { ph: [phone] } : {}),
     ...(external_id ? { external_id } : {}),
-    ...(lead_id ? { lead_id } : {}),
+    ...(first_name ? { fn: [first_name] } : {}),
+    ...(last_name ? { ln: [last_name] } : {}),
+    ...(gender ? { ge: [gender] } : {}),
+    ...(birthdate ? { db: [birthdate] } : {}),
+    ...(city ? { ct: [city] } : {}),
+    ...(state ? { st: [state] } : {}),
+    ...(zip ? { zp: [zip] } : {}),
+    ...(country_code ? { country: [country_code] } : {}),
+    // Meta requires lead_id verbatim — never hashed.
+    ...(raw_user_data.leadId ? { lead_id: raw_user_data.leadId } : {}),
   };
   if (payload.user_agent) user_data.client_user_agent = payload.user_agent;
   if (payload.fbp) user_data.fbp = payload.fbp;

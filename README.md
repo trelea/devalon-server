@@ -27,15 +27,47 @@ To rotate it, send the same body with `PUT /meta-pixel-access-tokens`.
 
 ## User data and privacy
 
-The signals envelope may carry `user_data` with raw `email`, `phone`,
-`externalId` and `leadId`. The Worker normalizes and hashes them with SHA-256
-(`em`, `ph`, `external_id`, `lead_id`) before calling the Graph API. Values
-already hashed by the SDK's `hash_meta_user_data()` (64 hex characters) are
-passed through unchanged. `fbp`, `fbc`, `client_user_agent` and
-`client_ip_address` are sent raw, as Meta requires. The optional `opt_out` and
-`data_processing_options` fields are forwarded at event level. The `custom_data` whitelist includes Meta's standard keys plus
-`status`, `lead_event_source` and `custom_properties` (objects are serialized
-to JSON strings). No PII is written to logs.
+The signals envelope may carry `user_data` with these customer fields, which
+the Worker normalizes and SHA-256 hashes before calling the Graph API:
+
+| Envelope field | Meta `user_data` key | Normalization |
+| --- | --- | --- |
+| `email` | `em` | Trim, lowercase |
+| `phone` | `ph` | Digits only, leading zeros dropped (country code required) |
+| `firstName` / `name` / `fn` | `fn` | Lowercase, punctuation stripped, never split |
+| `lastName` / `ln` | `ln` | Lowercase, punctuation stripped |
+| `externalId` | `external_id` | Trim; case-sensitive |
+| `ge` | `ge` | `f` or `m`; caller-supplied only |
+| `db` | `db` | `YYYYMMDD`; caller-supplied only |
+| `ct` / `st` / `zp` / `country` | same keys | Lowercase, no spaces or punctuation; auto-filled from `request.cf` |
+
+`ct`, `st`, `zp` and `country` are filled on every forwarded event from
+Cloudflare's `request.cf` (`city`, `regionCode`, `postalCode`, `country`) — no
+external call when those are present. Caller-supplied values always win,
+including already-hashed ones, so precise CRM data can override the IP estimate.
+
+When Cloudflare leaves a field empty, the Worker falls back to ipwho.is and then
+ipapi.co for the remaining gaps (first source wins). Configure them with
+`GEO_LOOKUP_URL_PRIMARY` and `GEO_LOOKUP_URL_SECONDARY`; set either to an empty
+string to disable it, and set `GEO_LOOKUP_KEY` if your provider requires one.
+Defaults are `https://ipwho.is/{ip}?fields=city,region_code,postal,country_code`
+and `https://ipapi.co/{ip}/json/`. Lookups run after the 202 response, time out
+after 1.5 s, and are cached per IP for 24 hours (one hour for empty results,
+max 1,000 entries). Failures are skipped silently and never block CAPI delivery.
+The visitor IP is sent to those providers only when a fallback runs. City and
+postal code may be wrong under VPNs or mobile networks. `ge` and `db` have no
+such source and stay empty unless the caller supplies them.
+
+`leadId` is the exception: Meta requires it verbatim, so it is emitted as
+`lead_id` without hashing. Values already hashed by the SDK's
+`hash_meta_user_data()` (64 hex characters, uppercase accepted) are passed
+through unchanged and lowercased. `fbp`, `fbc`, `client_user_agent` and
+`client_ip_address` are also sent raw, as Meta requires. Client and server
+normalization use identical rules. All hashes are computed in one parallel
+batch. The optional `opt_out` and `data_processing_options` fields are
+forwarded at event level. The `custom_data` whitelist includes Meta's standard
+keys plus `status`, `lead_event_source` and `custom_properties` (objects are
+serialized to JSON strings). No PII is written to logs.
 
 ## Local development
 

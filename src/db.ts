@@ -11,6 +11,10 @@ export interface Env extends DbEnv {
   ADMIN_TOKEN: string;
   META_GRAPH_API_VERSION?: string;
   META_GRAPH_API_BASE_URL?: string;
+  /** External geo fallback. Both default on; set to "" to disable one. */
+  GEO_LOOKUP_URL_PRIMARY?: string;
+  GEO_LOOKUP_URL_SECONDARY?: string;
+  GEO_LOOKUP_KEY?: string;
 }
 
 export interface Database {

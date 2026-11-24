@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/index.ts", "src/db.ts", "src/capi.ts"]
+  "include": ["src/index.ts", "src/db.ts", "src/capi.ts", "src/geo.ts"]
 }

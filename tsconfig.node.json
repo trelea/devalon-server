@@ -9,6 +9,7 @@
   "include": [
     "src/db.ts",
     "src/capi.ts",
+    "src/geo.ts",
     "src/scripts/**/*.ts",
     "src/migrations/**/*.ts"
   ]
