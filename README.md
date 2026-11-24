@@ -59,6 +59,20 @@ yarn build        # dry-run bundle into dist/
 yarn deploy
 ```
 
+## Logs
+
+The Worker emits one JSON line per event: `signals.in`, `capi.ok`, `capi.fail`,
+`token.created`, `token.missing`, `token.rejected`, `signals.rejected`. Tokens
+and raw event params are never logged. Watch them live with:
+
+```bash
+npx wrangler tail devalon-server
+```
+
+or in the dashboard under **Workers & Pages → devalon-server → Logs**. The
+Graph API call runs in `waitUntil`, so its success/failure line appears after
+the `202 Accepted` response.
+
 ## Custom domain
 
 The Worker is published on `workers.dev` by default. To match the SDK's default

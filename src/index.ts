@@ -42,6 +42,40 @@ function is_unique_error(error: unknown): boolean {
   );
 }
 
+type LogLevel = "info" | "warn" | "error";
+
+/** One JSON line per event; never pass tokens or raw event params here. */
+function log(
+  level: LogLevel,
+  event: string,
+  fields: Record<string, unknown> = {},
+): void {
+  const line = JSON.stringify({
+    level,
+    event,
+    time: new Date().toISOString(),
+    ...fields,
+  });
+
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  else console.info(line);
+}
+
+/** sendBeacon uses no-cors; expose the response so DevTools shows 200, not Blocked. */
+app.use("/:pixel_id/signals", async (c, next) => {
+  const origin = c.req.header("Origin");
+
+  c.header("Access-Control-Allow-Origin", origin ?? "*");
+  c.header("Access-Control-Allow-Methods", "POST, OPTIONS");
+  c.header("Access-Control-Allow-Headers", "Content-Type");
+  c.header("Vary", "Origin");
+
+  if (c.req.method === "OPTIONS") return c.body(null, 204);
+
+  await next();
+});
+
 app.get("/health", async (c) => {
   try {
     await sql`SELECT 1`.execute(get_db(c.env));
@@ -62,12 +96,13 @@ app.post("/meta-pixel-access-tokens", async (c) => {
   const admin_token = c.env.ADMIN_TOKEN;
 
   if (!admin_token) {
-    console.error("ADMIN_TOKEN is not configured");
+    log("error", "token.rejected", { reason: "server_misconfigured" });
     return c.json({ error: "Server is not configured" }, 500);
   }
 
   const provided = c.req.header("x-admin-token");
   if (!provided || !constant_time_equal(provided, admin_token)) {
+    log("warn", "token.rejected", { reason: "unauthorized" });
     return c.json({ error: "Unauthorized" }, 401);
   }
 
@@ -85,12 +120,17 @@ app.post("/meta-pixel-access-tokens", async (c) => {
   const { pixel_id, access_token } = body;
 
   if (!is_non_empty_string(pixel_id) || !PIXEL_ID_PATTERN.test(pixel_id.trim())) {
+    log("warn", "token.rejected", { reason: "invalid_pixel_id" });
     return c.json({ error: "pixel_id must be a numeric Meta pixel ID" }, 400);
   }
   if (
     !is_non_empty_string(access_token) ||
     access_token.trim().length > 4096
   ) {
+    log("warn", "token.rejected", {
+      reason: "invalid_access_token",
+      pixel_id: pixel_id.trim(),
+    });
     return c.json({ error: "access_token must be a non-empty string" }, 400);
   }
 
@@ -111,6 +151,10 @@ app.post("/meta-pixel-access-tokens", async (c) => {
       .execute();
   } catch (error) {
     if (is_unique_error(error)) {
+      log("warn", "token.rejected", {
+        reason: "duplicate",
+        pixel_id: clean_pixel_id,
+      });
       return c.json(
         {
           error:
@@ -120,9 +164,15 @@ app.post("/meta-pixel-access-tokens", async (c) => {
       );
     }
 
-    console.error("Failed to register access token:", error);
+    log("error", "token.rejected", {
+      reason: "db_error",
+      pixel_id: clean_pixel_id,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return c.json({ error: "Internal server error" }, 500);
   }
+
+  log("info", "token.created", { id, pixel_id: clean_pixel_id });
 
   return c.json(
     {
@@ -144,6 +194,7 @@ app.post("/:pixel_id/signals", async (c) => {
   const pixel_id = c.req.param("pixel_id");
 
   if (!PIXEL_ID_PATTERN.test(pixel_id)) {
+    log("warn", "signals.rejected", { reason: "invalid_pixel_id", pixel_id });
     return c.json({ error: "pixel_id must be a numeric Meta pixel ID" }, 400);
   }
 
@@ -176,9 +227,11 @@ app.post("/:pixel_id/signals", async (c) => {
   } = parsed;
 
   if (!is_non_empty_string(event_name) || !is_non_empty_string(event_id)) {
+    log("warn", "signals.rejected", { reason: "invalid_event", pixel_id });
     return c.json({ error: "event_name and event_id must be non-empty strings" }, 400);
   }
   if (typeof event_time !== "number" || !Number.isInteger(event_time)) {
+    log("warn", "signals.rejected", { reason: "invalid_event_time", pixel_id });
     return c.json({ error: "event_time must be an integer Unix timestamp" }, 400);
   }
 
@@ -187,6 +240,7 @@ app.post("/:pixel_id/signals", async (c) => {
     event_time < now_s - MAX_EVENT_AGE_S ||
     event_time > now_s + MAX_FUTURE_SKEW_S
   ) {
+    log("warn", "signals.rejected", { reason: "stale_event_time", pixel_id });
     return c.json({ error: "event_time is outside the accepted window" }, 400);
   }
 
@@ -209,10 +263,15 @@ app.post("/:pixel_id/signals", async (c) => {
       .where("pixel_id", "=", pixel_id)
       .executeTakeFirst();
   } catch (error) {
-    console.error("Failed to look up access token:", error);
+    log("error", "signals.rejected", {
+      reason: "db_error",
+      pixel_id,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return c.json({ error: "Internal server error" }, 500);
   }
   if (!token_row) {
+    log("warn", "token.missing", { pixel_id });
     return c.json({ error: "No access token registered for this pixel" }, 404);
   }
 
@@ -240,31 +299,52 @@ app.post("/:pixel_id/signals", async (c) => {
 
   const { event, test_event_code } = build_capi_event(payload, client_ip);
 
-  try {
-    const result = await send_to_meta(
-      pixel_id,
-      token_row.access_token,
-      event,
-      test_event_code,
-      {
-        base_url: c.env.META_GRAPH_API_BASE_URL,
-        version: c.env.META_GRAPH_API_VERSION,
-      },
-    );
+  log("info", "signals.in", {
+    pixel_id,
+    event_name: payload.event_name,
+    event_id: payload.event_id,
+    has_fbp: Boolean(payload.fbp),
+    has_fbc: Boolean(payload.fbc),
+    event_source_url: payload.event_source_url ?? "",
+  });
 
-    return c.json({
-      status: "ok",
-      events_received: result.events_received,
-      ...(result.fbtrace_id ? { fbtrace_id: result.fbtrace_id } : {}),
-    });
-  } catch (error) {
-    console.error(
-      `Meta CAPI request failed for pixel ${pixel_id}:`,
-      error instanceof CapiError ? (error.details ?? error.message) : error,
-    );
+  // Deliver to Meta after the response is sent. The browser uses sendBeacon
+  // and never reads the body, so a fast 202 is enough.
+  const delivery = send_to_meta(
+    pixel_id,
+    token_row.access_token,
+    event,
+    test_event_code,
+    {
+      base_url: c.env.META_GRAPH_API_BASE_URL,
+      version: c.env.META_GRAPH_API_VERSION,
+    },
+  ).then(
+    (result) => {
+      log("info", "capi.ok", {
+        pixel_id,
+        event_id: payload.event_id,
+        events_received: result.events_received,
+        ...(result.fbtrace_id ? { fbtrace_id: result.fbtrace_id } : {}),
+      });
+    },
+    (error: unknown) => {
+      log("error", "capi.fail", {
+        pixel_id,
+        event_id: payload.event_id,
+        error: error instanceof CapiError ? error.message : "unknown error",
+      });
+    },
+  );
 
-    return c.json({ error: "Meta CAPI request failed" }, 502);
+  const execution_ctx = c.executionCtx;
+  if (execution_ctx && typeof execution_ctx.waitUntil === "function") {
+    execution_ctx.waitUntil(delivery);
+  } else {
+    await delivery;
   }
+
+  return c.json({ status: "accepted" }, 202);
 });
 
 export default app;
